@@ -1,0 +1,50 @@
+<!--
+
+  Log4j2 configuration with AsyncLogger (LMAX Disruptor).
+  All loggers are async by default — set via system property below.
+
+  To activate async-all-loggers mode, add to JVM args:
+    -DLog4jContextSelector=org.apache.logging.log4j.core.async.AsyncLoggerContextSelector
+  Or rely on the <AsyncLogger> element used here for the application package.
+-->
+<Configuration status="WARN" monitorInterval="60">
+    <Properties>
+        <Property name="LOG_PATTERN">
+            %d{yyyy-MM-dd HH:mm:ss.SSS} [%t] %-5level %logger{36} - %msg%n
+        </Property>
+        <Property name="LOG_DIR">logs</Property>
+    </Properties>
+    <Appenders>
+        <!--
+         Console appender (development / container stdout)
+        -->
+        <Console name="Console" target="SYSTEM_OUT">
+            <PatternLayout pattern="${LOG_PATTERN}"/>
+        </Console>
+        <!-- Rolling file appender for production -->
+        <RollingFile name="RollingFile" fileName="${LOG_DIR}/xml-parser.log" filePattern="${LOG_DIR}/xml-parser-%d{yyyy-MM-dd}-%i.log.gz">
+            <PatternLayout pattern="${LOG_PATTERN}"/>
+            <Policies>
+                <TimeBasedTriggeringPolicy interval="1" modulate="true"/>
+                <SizeBasedTriggeringPolicy size="50MB"/>
+            </Policies>
+            <DefaultRolloverStrategy max="30"/>
+        </RollingFile>
+    </Appenders>
+    <Loggers>
+        <!--
+
+                  AsyncLogger for application classes — uses LMAX Disruptor ring buffer.
+                  includeLocation=false avoids costly stack-trace resolution on hot path.
+
+        -->
+        <AsyncLogger name="com.example.xml" level="INFO" additivity="false" includeLocation="false">
+            <AppenderRef ref="Console"/>
+            <AppenderRef ref="RollingFile"/>
+        </AsyncLogger>
+        <!-- Root logger (sync) for third-party libraries -->
+        <Root level="WARN">
+            <AppenderRef ref="Console"/>
+        </Root>
+    </Loggers>
+</Configuration>

@@ -1,0 +1,25 @@
+<web-app>
+  <display-name>xml-parser</display-name>
+  <!--
+
+          Servlet and listener registrations are done via annotations
+          (@WebServlet, @WebListener). This descriptor only sets
+          application-wide configuration.
+
+  -->
+  <!-- Reject requests with no matching mapping -->
+  <error-page>
+    <error-code>404</error-code>
+    <location>/error/404</location>
+  </error-page>
+  <error-page>
+    <error-code>500</error-code>
+    <location>/error/500</location>
+  </error-page>
+  <!--
+   Session timeout (irrelevant for stateless REST, but required by spec)
+  -->
+  <session-config>
+    <session-timeout>1</session-timeout>
+  </session-config>
+</web-app>
