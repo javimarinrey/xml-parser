@@ -27,6 +27,18 @@ import java.util.stream.Collectors;
  * <p><b>Phase 2</b> — delegates to the matching {@link XmlParser} using the
  * <em>same</em> {@link XMLStreamReader}. No re-parsing, no stream copy.
  *
+ * <h3>Logging strategy (zero overhead on hot path)</h3>
+ * <ul>
+ *   <li>INFO — startup/shutdown only: one log per JVM lifecycle.</li>
+ *   <li>DEBUG — per-request tipo + timing, guarded by {@code isDebugEnabled()}.
+ *       In production (INFO level) the guard short-circuits before any
+ *       {@code String} is allocated.</li>
+ *   <li>WARN/ERROR — only on exceptional paths (unknown tipo, close failure).
+ *       These are infrequent by definition.</li>
+ *   <li>All calls use SLF4J parameterised messages ({}) — no string
+ *       concatenation at the call site regardless of level.</li>
+ * </ul>
+ *
  * <p>This class is thread-safe. The internal {@code Map} is immutable after
  * construction. Each call to {@link #dispatch} creates its own reader.
  */
@@ -58,6 +70,7 @@ public final class ParserRouter {
                                 "Tipo duplicado en parsers: " + a.tipo()); }
                 ));
 
+        // INFO: fires once at startup, never on the hot path
         log.info("ParserRouter inicializado con {} tipos: {}",
                 this.parsers.size(), this.parsers.keySet());
     }
@@ -66,13 +79,11 @@ public final class ParserRouter {
      * Dispatches the XML in {@code rawXml} to the appropriate parser.
      *
      * @param rawXml the raw request body; ownership is NOT transferred
-     *               (the caller remains responsible for closing it)
      * @return the DTO produced by the matching parser
      * @throws XmlParseException    if the XML is malformed or {@code <tipo>} is absent
      * @throws UnknownTipoException if no parser is registered for the detected tipo
      */
     public Object dispatch(InputStream rawXml) {
-        // Wrap in a buffer if not already buffered — StAX has no internal buffer
         InputStream buffered = rawXml instanceof BufferedInputStream
                 ? rawXml
                 : new BufferedInputStream(rawXml, BUFFER_SIZE);
@@ -81,10 +92,28 @@ public final class ParserRouter {
         try {
             // ── Phase 1: peek for <tipo> ──────────────────────────────────────
             String tipo = peekTipo(reader);
-            log.debug("Tipo detectado: {}", tipo);
+
+            /*
+             * DEBUG guard: isDebugEnabled() is a simple volatile boolean read
+             * (~1 ns). Without the guard, SLF4J would still skip I/O, but the
+             * JVM would still evaluate the arguments (tipo is already a String
+             * here, so cost is minimal — the guard is more important on calls
+             * that would build a String via concatenation or toString()).
+             */
+            if (log.isDebugEnabled()) {
+                log.debug("Fase 1 completada: tipo={}", tipo);
+            }
 
             // ── Phase 2: full parse with the same reader ──────────────────────
-            return route(tipo, reader);
+            Object result = route(tipo, reader);
+
+            if (log.isDebugEnabled()) {
+                // Lambda form: the toString() is only called if DEBUG is active.
+                // Use this pattern whenever the argument requires non-trivial work.
+                log.debug("Fase 2 completada: dto={}", result);
+            }
+
+            return result;
 
         } catch (XMLStreamException e) {
             throw new XmlParseException("Error StAX durante el parseo", e);
@@ -96,10 +125,10 @@ public final class ParserRouter {
     // ── Private helpers ───────────────────────────────────────────────────────
 
     /**
-     * Advances the reader until it finds a {@code START_ELEMENT} named
-     * {@value #TIPO_TAG}, then returns its text content via
-     * {@link XMLStreamReader#getElementText()} — which also consumes the
-     * matching {@code END_ELEMENT}, leaving the cursor ready for phase 2.
+     * Advances the reader until it finds {@code <tipo>}, reads its text via
+     * {@link XMLStreamReader#getElementText()} (which also consumes the
+     * closing tag), and returns. The reader is left positioned just after
+     * {@code </tipo>} — ready for phase 2.
      */
     private static String peekTipo(XMLStreamReader reader) throws XMLStreamException {
         while (reader.hasNext()) {
@@ -116,14 +145,12 @@ public final class ParserRouter {
         throw new XmlParseException("No se encontró el tag <tipo> en el XML");
     }
 
-    /**
-     * Looks up the parser for {@code tipo} and delegates phase 2.
-     * Cast is safe because each parser is registered with its own type token.
-     */
     @SuppressWarnings("unchecked")
     private <T> T route(String tipo, XMLStreamReader reader) throws XMLStreamException {
         XmlParser<T> parser = (XmlParser<T>) parsers.get(tipo);
         if (parser == null) {
+            // WARN: infrequent — bad client request, not a hot path
+            log.warn("Tipo no registrado: '{}'", tipo);
             throw new UnknownTipoException(tipo);
         }
         return parser.parse(reader);
@@ -134,6 +161,7 @@ public final class ParserRouter {
             try {
                 reader.close();
             } catch (XMLStreamException e) {
+                // WARN: should never happen in practice; cheap to log
                 log.warn("Error al cerrar XMLStreamReader", e);
             }
         }

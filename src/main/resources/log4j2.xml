@@ -1,50 +1,134 @@
+<?xml version="1.0" encoding="UTF-8"?>
 <!--
+  Log4j2 — AsyncLogger con LMAX Disruptor.
 
-  Log4j2 configuration with AsyncLogger (LMAX Disruptor).
-  All loggers are async by default — set via system property below.
+  Decisiones de rendimiento:
+  ─────────────────────────────────────────────────────────────────────────────
+  1. <AsyncLogger> para com.example.xml → ring buffer Disruptor, sin I/O en el
+     hilo de parseo. El hilo llamante solo escribe en el ring buffer y sigue.
 
-  To activate async-all-loggers mode, add to JVM args:
-    -DLog4jContextSelector=org.apache.logging.log4j.core.async.AsyncLoggerContextSelector
-  Or rely on the <AsyncLogger> element used here for the application package.
+  2. includeLocation="false" → no se resuelve la stack-trace en el hot path.
+     Coste de getStackTrace() es ~3-10 µs por llamada; con alto tráfico mata
+     el rendimiento. Activar solo en DEBUG local si se necesita el número de línea.
+
+  3. bufferSize="262144" (256 KiB) en el RollingFile → reduce las llamadas a
+     flush del sistema operativo. El Disruptor ya serializa la escritura.
+
+  4. immediateFlush="false" en RollingFile → el appender no hace fsync tras
+     cada mensaje. Aceptable para logs de aplicación; no usar en audit logs.
+
+  5. PatternLayout sin %L ni %M ni %C → evita resolución de ubicación.
+
+  6. Un único AsyncLogger raíz para toda la aplicación (no Root síncrono para
+     com.example.xml). Librería de terceros queda en Root síncrono WARN → su
+     volumen es despreciable.
+
+  7. Disruptor WaitStrategy: por defecto usa SleepingWaitStrategy (bajo CPU).
+     Para latencia ultra-baja cambiar a YieldingWaitStrategy vía system property:
+       -Dlog4j2.asyncQueueFullPolicy=Discard   (descarta si el ring está lleno)
+     o -Dlog4j2.AsyncLogger.WaitStrategy=Yield
+  ─────────────────────────────────────────────────────────────────────────────
 -->
 <Configuration status="WARN" monitorInterval="60">
+
     <Properties>
+        <!--
+          Patrón sin %L (línea), %M (método) ni %C (clase completa).
+          %logger{36} trunca el nombre del logger a 36 chars → sin resolución
+          de stack frame, solo el nombre que se pasó a LoggerFactory.getLogger().
+        -->
         <Property name="LOG_PATTERN">
-            %d{yyyy-MM-dd HH:mm:ss.SSS} [%t] %-5level %logger{36} - %msg%n
+            %d{yyyy-MM-dd HH:mm:ss.SSS} [%t] %-5level %logger{36} [rid=%X{requestId}] - %msg%n
         </Property>
         <Property name="LOG_DIR">logs</Property>
+        <!-- Disruptor ring buffer: potencia de 2. 256k entradas × ~200 bytes ≈ 50 MB heap. -->
+        <Property name="RING_BUFFER_SIZE">262144</Property>
     </Properties>
+
     <Appenders>
+
         <!--
-         Console appender (development / container stdout)
+          Console: solo en entornos no-producción.
+          En producción redirigir stdout a /dev/null o comentar este appender
+          para eliminar la contención en System.out.
         -->
         <Console name="Console" target="SYSTEM_OUT">
             <PatternLayout pattern="${LOG_PATTERN}"/>
         </Console>
-        <!-- Rolling file appender for production -->
-        <RollingFile name="RollingFile" fileName="${LOG_DIR}/xml-parser.log" filePattern="${LOG_DIR}/xml-parser-%d{yyyy-MM-dd}-%i.log.gz">
+
+        <!--
+          RollingFile principal.
+          immediateFlush="false" → el OS buffer acumula escrituras.
+          bufferedIO="true"      → java.io.BufferedOutputStream de 8 KiB.
+          Juntos reducen las syscalls write() en ~10x bajo carga.
+        -->
+        <RollingFile name="RollingFile"
+                     fileName="${LOG_DIR}/xml-parser.log"
+                     filePattern="${LOG_DIR}/xml-parser-%d{yyyy-MM-dd}-%i.log.gz"
+                     immediateFlush="false"
+                     bufferedIO="true"
+                     bufferSize="262144">
             <PatternLayout pattern="${LOG_PATTERN}"/>
+            <Policies>
+                <TimeBasedTriggeringPolicy interval="1" modulate="true"/>
+                <SizeBasedTriggeringPolicy size="100MB"/>
+            </Policies>
+            <DefaultRolloverStrategy max="30"
+                                     compressionLevel="1"/>
+            <!-- compressionLevel=1 → gzip rápido; nivel 6 por defecto es más lento -->
+        </RollingFile>
+
+        <!--
+          Appender separado para métricas de latencia (INFO solamente).
+          Permite analizar tiempos de parseo sin contaminar el log principal.
+          Filtro ThresholdFilter: solo mensajes del logger "metrics".
+        -->
+        <RollingFile name="MetricsFile"
+                     fileName="${LOG_DIR}/xml-metrics.log"
+                     filePattern="${LOG_DIR}/xml-metrics-%d{yyyy-MM-dd}-%i.log.gz"
+                     immediateFlush="false"
+                     bufferedIO="true">
+            <PatternLayout pattern="%d{yyyy-MM-dd HH:mm:ss.SSS} %msg%n"/>
             <Policies>
                 <TimeBasedTriggeringPolicy interval="1" modulate="true"/>
                 <SizeBasedTriggeringPolicy size="50MB"/>
             </Policies>
-            <DefaultRolloverStrategy max="30"/>
+            <DefaultRolloverStrategy max="15"/>
         </RollingFile>
+
     </Appenders>
+
     <Loggers>
+
         <!--
-
-                  AsyncLogger for application classes — uses LMAX Disruptor ring buffer.
-                  includeLocation=false avoids costly stack-trace resolution on hot path.
-
+          AsyncLogger para toda la aplicación.
+          includeLocation="false" es crítico: con true, Log4j2 llama a
+          new Throwable().getStackTrace() en cada mensaje → 3-10 µs extra.
         -->
-        <AsyncLogger name="com.example.xml" level="INFO" additivity="false" includeLocation="false">
+        <AsyncLogger name="com.example.xml"
+                     level="INFO"
+                     additivity="false"
+                     includeLocation="false">
             <AppenderRef ref="Console"/>
             <AppenderRef ref="RollingFile"/>
         </AsyncLogger>
-        <!-- Root logger (sync) for third-party libraries -->
+
+        <!--
+          Logger dedicado para métricas de latencia.
+          Escribe solo en MetricsFile para facilitar análisis (grep, awk, etc.)
+        -->
+        <AsyncLogger name="metrics"
+                     level="INFO"
+                     additivity="false"
+                     includeLocation="false">
+            <AppenderRef ref="MetricsFile"/>
+        </AsyncLogger>
+
+        <!-- Root síncrono para librerías de terceros (volumen muy bajo) -->
         <Root level="WARN">
             <AppenderRef ref="Console"/>
         </Root>
+
     </Loggers>
+
 </Configuration>

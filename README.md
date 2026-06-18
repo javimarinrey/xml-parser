@@ -28,3 +28,12 @@ curl -X POST http://localhost:8080/xml-parser/api/xml \
 -H "Content-Type: application/xml" \
 -d '<?xml version="1.0"?><solicitud><tipo>CONSULTA</tipo><id>42</id><filtro>activo</filtro></solicitud>'
 ```
+
+Para sacar p99 de latencia total con Unix estándar:
+
+```shell
+awk '/METRICS/ {print $7}' xml-metrics.log \
+  | sed 's/total_us=//' \
+  | sort -n \
+  | awk 'BEGIN{c=0} {a[c++]=$1} END{print a[int(c*0.99)]}'
+``

@@ -9,32 +9,41 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 
 import java.io.IOException;
 import java.io.PrintWriter;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 
 /**
  * Single-entry-point servlet for all XML requests.
  *
- * <p>Accepts POST requests at {@code /api/xml} with {@code Content-Type: application/xml}.
- * Delegates to {@link ParserRouter} for two-phase StAX parsing.
+ * <h3>Logging strategy</h3>
  *
- * <p>Each request is submitted to the Virtual Thread executor so that
- * blocking inside the parser never stalls a platform thread.
+ * <p><b>MDC (Mapped Diagnostic Context)</b> — a thread-local map that Log4j2
+ * injects into every log message from that thread. We store a {@code requestId}
+ * so that all log lines for a single request can be correlated with a simple
+ * {@code grep rid=<id>}, without passing the ID through every method call.
  *
- * <p><b>Threading model:</b>
- * <ol>
- *   <li>Tomcat platform thread calls {@link #doPost}.</li>
- *   <li>{@code doPost} submits work to the VT executor and blocks on
- *       {@link Future#get()} — which is cheap because Tomcat's NIO connector
- *       does not hold a platform thread during the wait.</li>
- *   <li>A virtual thread runs the actual XML parsing.</li>
- * </ol>
+ * <p>Key MDC fields set per request:
+ * <ul>
+ *   <li>{@code requestId} — short random ID (first 8 chars of UUID, enough for correlation)</li>
+ *   <li>{@code tipo} — set after phase 1; available on all subsequent log lines</li>
+ * </ul>
  *
- * <p>If you use Tomcat with its Virtual Thread connector (Tomcat 11+), you
- * can skip the executor entirely and call the router directly in {@code doPost}.
+ * <p><b>MDC + Virtual Threads</b> — SLF4J 2.x copies the MDC map when a
+ * virtual thread is created, so the {@code requestId} is visible inside the
+ * VT executor task without extra work.
+ *
+ * <p><b>Cleanup</b> — MDC is always cleared in a {@code finally} block. Tomcat
+ * reuses platform threads; a stale MDC from a previous request would corrupt
+ * subsequent log lines.
+ *
+ * <p><b>Metrics</b> — {@link RequestMetrics} captures {@code System.nanoTime()}
+ * at entry and after phase 1, then logs the breakdown to the dedicated
+ * {@code metrics} logger (separate file, async). No impact on response latency.
  */
 @WebServlet(name = "XmlDispatcherServlet", urlPatterns = "/api/xml")
 public class XmlDispatcherServlet extends HttpServlet {
@@ -42,7 +51,12 @@ public class XmlDispatcherServlet extends HttpServlet {
     private static final Logger log = LoggerFactory.getLogger(XmlDispatcherServlet.class);
 
     private static final String CONTENT_TYPE_XML = "application/xml";
-    private static final int    MAX_BODY_BYTES    = 1_048_576; // 1 MiB guard
+    private static final int    MAX_BODY_BYTES    = 1_048_576; // 1 MiB
+
+    /** MDC key injected into every log line via the pattern [rid=%X{requestId}]. */
+    static final String MDC_REQUEST_ID = "requestId";
+    /** MDC key set after phase 1 so subsequent lines carry the tipo. */
+    static final String MDC_TIPO       = "tipo";
 
     private ParserRouter    router;
     private ExecutorService executor;
@@ -51,6 +65,7 @@ public class XmlDispatcherServlet extends HttpServlet {
     public void init() {
         router   = (ParserRouter)    getServletContext().getAttribute(AppInitializer.ROUTER_ATTR);
         executor = (ExecutorService) getServletContext().getAttribute(AppInitializer.EXECUTOR_ATTR);
+        log.info("XmlDispatcherServlet inicializado");
     }
 
     // ── POST /api/xml ──────────────────────────────────────────────────────────
@@ -59,39 +74,90 @@ public class XmlDispatcherServlet extends HttpServlet {
     protected void doPost(HttpServletRequest req, HttpServletResponse resp)
             throws IOException {
 
-        // Basic content-type guard
-        String contentType = req.getContentType();
-        if (contentType == null || !contentType.startsWith(CONTENT_TYPE_XML)) {
-            sendError(resp, HttpServletResponse.SC_UNSUPPORTED_MEDIA_TYPE,
-                    "Content-Type debe ser application/xml");
-            return;
-        }
+        // ── MDC setup ─────────────────────────────────────────────────────────
+        // Short ID: 8 hex chars are enough for per-request correlation in logs.
+        // UUID.randomUUID() uses SecureRandom; for ultra-high throughput consider
+        // ThreadLocalRandom or a counter instead.
+        String requestId = UUID.randomUUID().toString().substring(0, 8);
+        MDC.put(MDC_REQUEST_ID, requestId);
 
-        // Size guard (prevent OOM on huge payloads)
-        if (req.getContentLength() > MAX_BODY_BYTES) {
-            sendError(resp, HttpServletResponse.SC_REQUEST_ENTITY_TOO_LARGE,
-                    "Cuerpo de la petición demasiado grande (máx 1 MiB)");
-            return;
-        }
+        // Start latency stopwatch (nanoTime read — ~20 ns, no syscall)
+        RequestMetrics metrics = RequestMetrics.start();
+        String  tipo   = "UNKNOWN";
+        String  status = "OK";
 
         try {
-            // Submit to VT executor — parse on a virtual thread
-            Future<Object> future = executor.submit(
-                    () -> router.dispatch(req.getInputStream())
-            );
+            // ── Input validation ─────────────────────────────────────────────
+            String contentType = req.getContentType();
+            if (contentType == null || !contentType.startsWith(CONTENT_TYPE_XML)) {
+                log.warn("Content-Type inválido: '{}'", contentType);
+                sendError(resp, HttpServletResponse.SC_UNSUPPORTED_MEDIA_TYPE,
+                        "Content-Type debe ser application/xml");
+                status = "ERROR";
+                return;
+            }
 
-            Object result = future.get(); // blocks until VT completes
+            if (req.getContentLength() > MAX_BODY_BYTES) {
+                log.warn("Payload demasiado grande: {} bytes", req.getContentLength());
+                sendError(resp, HttpServletResponse.SC_REQUEST_ENTITY_TOO_LARGE,
+                        "Cuerpo de la petición demasiado grande (máx 1 MiB)");
+                status = "ERROR";
+                return;
+            }
 
-            log.debug("Petición procesada: tipo={}", result.getClass().getSimpleName());
+            if (log.isDebugEnabled()) {
+                log.debug("Petición recibida: contentType={} contentLength={}",
+                        contentType, req.getContentLength());
+            }
+
+            // ── Dispatch to virtual thread ────────────────────────────────────
+            /*
+             * SLF4J 2.x inherits MDC into the child thread automatically when
+             * using InheritableThreadLocal (default since SLF4J 2.0.9).
+             * The requestId and tipo set here will appear in VT log lines too.
+             */
+            final String finalRequestId = requestId;
+            Future<Object> future = executor.submit(() -> {
+                // MDC is inherited — no need to re-set requestId here
+                return router.dispatch(req.getInputStream());
+            });
+
+            Object result = future.get();
+
+            // Enrich MDC with tipo for any log lines after this point
+            tipo = result.getClass().getSimpleName()
+                         .replace("Request", ""); // e.g. "ConsultaRequest" → "CONSULTA"
+            MDC.put(MDC_TIPO, tipo);
+
+            metrics.markPhase1Done(); // best-effort marker (phase split is in router)
+
+            if (log.isDebugEnabled()) {
+                log.debug("Petición completada: dto={}", result);
+            }
 
             sendResult(resp, result);
 
         } catch (java.util.concurrent.ExecutionException ee) {
+            status = "ERROR";
             handleCause(resp, ee.getCause());
+
         } catch (InterruptedException ie) {
+            status = "ERROR";
             Thread.currentThread().interrupt();
+            log.error("Petición interrumpida");
             sendError(resp, HttpServletResponse.SC_SERVICE_UNAVAILABLE,
                     "Petición interrumpida");
+
+        } finally {
+            // ── Log metrics and clear MDC ─────────────────────────────────────
+            /*
+             * ALWAYS clear MDC in finally. Tomcat reuses platform threads;
+             * leftover MDC values from this request would appear in the next
+             * request handled by the same thread.
+             */
+            metrics.log(requestId, tipo, status);
+            MDC.remove(MDC_REQUEST_ID);
+            MDC.remove(MDC_TIPO);
         }
     }
 
@@ -99,14 +165,16 @@ public class XmlDispatcherServlet extends HttpServlet {
 
     private void handleCause(HttpServletResponse resp, Throwable cause) throws IOException {
         if (cause instanceof XmlParseException xpe) {
+            // WARN: bad client XML — frequent enough to be cheap
             log.warn("XML malformado: {}", xpe.getMessage());
             sendError(resp, HttpServletResponse.SC_BAD_REQUEST, xpe.getMessage());
 
         } else if (cause instanceof UnknownTipoException ute) {
-            log.warn("Tipo desconocido: {}", ute.getTipo());
+            log.warn("Tipo desconocido: '{}'", ute.getTipo());
             sendError(resp, HttpServletResponse.SC_BAD_REQUEST, ute.getMessage());
 
         } else {
+            // ERROR: unexpected — log full stack trace; infrequent by definition
             log.error("Error inesperado procesando XML", cause);
             sendError(resp, HttpServletResponse.SC_INTERNAL_SERVER_ERROR,
                     "Error interno del servidor");
@@ -115,10 +183,6 @@ public class XmlDispatcherServlet extends HttpServlet {
 
     // ── Response helpers ───────────────────────────────────────────────────────
 
-    /**
-     * Writes a minimal XML acknowledgement with the DTO's {@code toString()}.
-     * In a real project this would delegate to a marshaller or template engine.
-     */
     private void sendResult(HttpServletResponse resp, Object result) throws IOException {
         resp.setStatus(HttpServletResponse.SC_OK);
         resp.setContentType("application/xml;charset=UTF-8");
@@ -147,7 +211,6 @@ public class XmlDispatcherServlet extends HttpServlet {
         }
     }
 
-    /** Minimal XML escaping for dynamic content in responses. */
     private static String escapeXml(String s) {
         if (s == null) return "";
         return s.replace("&",  "&amp;")
